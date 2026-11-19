@@ -53,6 +53,11 @@ except ImportError as e:
     print(f"ERROR: missing dependency ({e.name}). Run: pip install tqdm mutagen musicbrainzngs")
     sys.exit(1)
 
+try:
+    from send2trash import send2trash
+except ImportError:
+    send2trash = None          # --trash refuses to run without it; nothing is faked
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -72,8 +77,9 @@ INCOMPLETE_DIR = LIBRARY_ROOT / "sort_script" / "aaa_incomplete"
 DELETE_DIR = LIBRARY_ROOT / "sort_script" / "aaa_delete"
 SUPPORTED_EXTENSIONS = {'.mp3', '.m4a', '.flac'}
 
+__version__ = "3.0"   # single source of truth; pyproject.toml carries the same value
 MB_APP_NAME = "LeftoverCleanupScript"
-MB_APP_VERSION = "3.0"
+MB_APP_VERSION = __version__
 MB_CONTACT = "your-email-or-project-url-here"   # <-- fill in (or set it in Settings)
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN", "")   # set in Settings; goes into the beets config
 MB_MIN_SCORE = 90                 # accept a search result on score alone
@@ -102,6 +108,7 @@ BEETS_RUNTIME_CONFIG = Path(__file__).with_name("beets_runtime_config.yaml")
 PROTECTED_DIRS = (COMPLETE_DIR, INCOMPLETE_DIR, DELETE_DIR, CUE_DEST)
 
 DRY_RUN = False   # set by --dry-run
+USE_TRASH = False  # set by --trash: route deletes through the Recycle Bin
 
 
 def act(desc: str, fn, *a, **kw):
@@ -109,6 +116,10 @@ def act(desc: str, fn, *a, **kw):
     if DRY_RUN:
         print(f"  [DRY RUN] {desc}")
         return None
+    if USE_TRASH and fn in (os.remove, shutil.rmtree):
+        if send2trash is None:
+            raise RuntimeError("send2trash is not installed; refusing to delete permanently")
+        return send2trash(str(a[0]))
     return fn(*a, **kw)
 
 
@@ -150,15 +161,26 @@ class PipelineLock:
         except (OSError, ValueError):
             return False
 
+    # A lock file is created empty and the PID written a moment later, so an
+    # empty (or torn) lock is only stale once it is old enough that no live
+    # process could still be about to write its PID.
+    STALE_LOCK_AGE_SECONDS = 10
+
     def _clear_stale(self) -> bool:
         try:
             text = self.path.read_text(encoding="utf-8").strip()
         except OSError:
             return False
-        if not text.isdigit():
-            return False
-        if self._pid_alive(int(text)):
-            return False
+        if text.isdigit():
+            if self._pid_alive(int(text)):
+                return False
+        else:
+            try:
+                age = time.time() - self.path.stat().st_mtime
+            except OSError:
+                return False
+            if age < self.STALE_LOCK_AGE_SECONDS:
+                return False
         try:
             self.path.unlink()
         except OSError:
@@ -182,7 +204,7 @@ class PipelineLock:
             suffix = f" (PID {holder})" if holder.isdigit() else ""
             raise PipelineBusy(
                 f"A pipeline is already running{suffix}. "
-                "Wait for it to finish, then try again."
+                f"Wait for it to finish, then try again. (Lock file: {self.path})"
             )
         except OSError as e:
             self._local.release()
@@ -1391,7 +1413,7 @@ def run_cleanup(source: Path) -> None:
 # =============================================================================
 
 def main() -> None:
-    global DRY_RUN, AAC_BITRATE, MB_CONTACT
+    global DRY_RUN, USE_TRASH, AAC_BITRATE, MB_CONTACT
     ap = argparse.ArgumentParser(description="Convert FLAC to M4A, then dedup/verify/sort the folder.")
     ap.add_argument("folder", nargs="?", help="Music folder (prompted if omitted)")
     ap.add_argument("-y", "--non-interactive", action="store_true",
@@ -1400,11 +1422,19 @@ def main() -> None:
     ap.add_argument("--skip-convert", action="store_true")
     ap.add_argument("--skip-cleanup", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="Show what would happen; change nothing")
+    ap.add_argument("--trash", action="store_true",
+                    help="Send deleted files to the Recycle Bin instead of deleting permanently "
+                         "(requires send2trash; refuses to run without it)")
     ap.add_argument("--contact", help="MusicBrainz contact (email or project URL)")
     ap.add_argument("--bitrate", help="AAC bitrate for conversion (default 256k)")
-    ap.add_argument("--version", action="version", version="Music Organizer 3.0")
+    ap.add_argument("--version", action="version", version=f"Music Organizer {__version__}")
     args = ap.parse_args()
     DRY_RUN = args.dry_run
+    if args.trash:
+        if send2trash is None:
+            print("❌ --trash needs the send2trash package (pip install -r requirements-optional.txt).")
+            sys.exit(1)
+        USE_TRASH = True
     if args.contact:
         MB_CONTACT = args.contact
     if args.bitrate:

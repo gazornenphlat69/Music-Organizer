@@ -52,7 +52,7 @@ def settings_update(values: dict) -> None:
     allowed = core.default_settings().keys() | {"last_tab"}
     with _settings_lock:
         for k, v in values.items():
-            if k == "discogs_token" and not str(v or "").strip():
+            if k in ("discogs_token", "plex_token") and not str(v or "").strip():
                 continue                      # blank keeps the saved token; the browser never sees it
             if k in allowed:
                 SETTINGS[k] = v

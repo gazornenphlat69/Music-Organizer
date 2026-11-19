@@ -79,6 +79,24 @@ def test_settings_round_trip_filters_unknown_keys(tmp_path, monkeypatch):
     assert "evil_key" not in data
 
 
+def test_settings_blank_plex_token_keeps_saved_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(toolkit_web.core, "SETTINGS_FILE", tmp_path / "music_toolkit_settings.json")
+    monkeypatch.setitem(toolkit_web.SETTINGS, "plex_token", "saved-token")
+    monkeypatch.setitem(toolkit_web.SETTINGS, "plex_remember_token", True)
+    monkeypatch.setitem(toolkit_web.SETTINGS, "discogs_token", "saved-discogs")
+    monkeypatch.setitem(toolkit_web.SETTINGS, "discogs_remember_token", True)
+    client = toolkit_web.app.test_client()
+    resp = client.post("/api/settings", json={"plex_token": "", "discogs_token": ""})
+    assert resp.status_code == 200
+    assert toolkit_web.SETTINGS["plex_token"] == "saved-token"
+    assert toolkit_web.SETTINGS["discogs_token"] == "saved-discogs"
+    assert resp.get_json()["settings"]["plex_token_set"] is True
+    # a non-blank value still updates it
+    resp = client.post("/api/settings", json={"plex_token": "new-token"})
+    assert resp.status_code == 200
+    assert toolkit_web.SETTINGS["plex_token"] == "new-token"
+
+
 def test_fs_lists_directories(tmp_path):
     (tmp_path / "alpha").mkdir()
     (tmp_path / "beta").mkdir()

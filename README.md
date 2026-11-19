@@ -84,6 +84,7 @@ python music_pipeline.py "D:\Music\inbox" --workers 6 -y
 Useful flags:
 
 - `--dry-run` — show what would happen; change nothing
+- `--trash` — send deleted files to the Recycle Bin instead of deleting permanently (needs `send2trash` from `requirements-optional.txt`)
 - `--skip-convert` — only run the cleanup stage
 - `--skip-cleanup` — only run FLAC conversion
 - `-y` — no prompts (useful for scheduled runs)

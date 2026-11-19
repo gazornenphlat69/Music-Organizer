@@ -199,12 +199,10 @@ class Settings:
                 self.data[k] = v.get()
             except tk.TclError:
                 pass
-        if not self.data.get("plex_remember_token"):
-            self.data.pop("plex_token", None)
         try:
-            tmp = SETTINGS_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
-            tmp.replace(SETTINGS_FILE)
+            # One save path for both apps: strips unremembered tokens (Plex and
+            # Discogs) and keeps a .bak backup, like the web app.
+            core.save_settings(self.data)
         except Exception as e:
             print(f"Could not save settings: {e}")
 

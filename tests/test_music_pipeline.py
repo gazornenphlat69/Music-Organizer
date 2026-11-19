@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import re
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -167,6 +170,84 @@ def test_pipeline_lock_is_exclusive_and_reusable(tmp_path):
         assert path.exists()
     finally:
         second.release()
+
+
+def test_pipeline_lock_treats_empty_lock_as_stale(tmp_path):
+    # A crash between creating the lock file and writing the PID leaves an
+    # empty file that used to block every later run forever.
+    path = tmp_path / "pipeline.lock"
+    path.write_text("")
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    lock = mp.PipelineLock(path)
+    lock.acquire()
+    try:
+        assert path.exists()
+    finally:
+        lock.release()
+
+
+def test_pipeline_lock_treats_garbage_lock_as_stale(tmp_path):
+    path = tmp_path / "pipeline.lock"
+    path.write_text("not-a-pid")
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    lock = mp.PipelineLock(path)
+    lock.acquire()
+    try:
+        assert path.exists()
+    finally:
+        lock.release()
+
+
+def test_pipeline_lock_does_not_clear_fresh_empty_lock(tmp_path):
+    # Just created: a live process may still be about to write its PID, so a
+    # fresh empty lock must still refuse - and the message names the file.
+    path = tmp_path / "pipeline.lock"
+    path.write_text("")
+    with pytest.raises(mp.PipelineBusy) as excinfo:
+        mp.PipelineLock(path).acquire()
+    assert str(path) in str(excinfo.value)
+
+
+# ---------------------------------------------------------------- --trash routing
+
+def test_act_routes_deletes_to_trash_when_enabled(tmp_path, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(mp, "send2trash", lambda p: calls.append(p))
+    monkeypatch.setattr(mp, "USE_TRASH", True)
+    target = tmp_path / "gone.txt"
+    target.write_text("x")
+    mp.act("delete gone.txt", os.remove, target)
+    assert calls == [str(target)]
+    assert target.exists()  # the stub records the call; it did not delete
+
+
+def test_act_refuses_permanent_delete_when_trash_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(mp, "send2trash", None)
+    monkeypatch.setattr(mp, "USE_TRASH", True)
+    target = tmp_path / "gone.txt"
+    target.write_text("x")
+    with pytest.raises(RuntimeError):
+        mp.act("delete gone.txt", os.remove, target)
+    assert target.exists()
+
+
+def test_act_still_deletes_permanently_without_trash(tmp_path, monkeypatch):
+    monkeypatch.setattr(mp, "USE_TRASH", False)
+    target = tmp_path / "gone.txt"
+    target.write_text("x")
+    mp.act("delete gone.txt", os.remove, target)
+    assert not target.exists()
+
+
+# ---------------------------------------------------------------- version
+
+def test_version_is_single_source_of_truth():
+    pyproject = Path(mp.__file__).with_name("pyproject.toml").read_text(encoding="utf-8")
+    declared = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+    assert declared == mp.__version__
+    assert mp.MB_APP_VERSION == mp.__version__
 
 
 # ---------------------------------------------------------------- multi-disc grouping
