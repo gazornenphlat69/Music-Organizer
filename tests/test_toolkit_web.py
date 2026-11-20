@@ -90,3 +90,80 @@ def test_fs_lists_directories(tmp_path):
     names = [d["name"] for d in data["dirs"]]
     assert "alpha" in names and "beta" in names
     assert "file.txt" not in names
+
+
+# ---------------------------------------------------------------- access token
+
+def test_token_check_rejects_non_ascii_without_crashing(monkeypatch):
+    monkeypatch.setattr(toolkit_web, "ACCESS_TOKEN", "abc123")
+    response = toolkit_web.app.test_client().get("/api/state?token=t%C3%B6k%C3%A9n")
+
+    assert response.status_code == 403
+
+
+def test_token_check_accepts_correct_token_and_rejects_wrong(monkeypatch):
+    monkeypatch.setattr(toolkit_web, "ACCESS_TOKEN", "abc123")
+    client = toolkit_web.app.test_client()
+
+    assert client.get("/api/state?token=abc123").status_code == 200
+    assert client.get("/api/state?token=wrong").status_code == 403
+    assert client.get("/api/state").status_code == 403
+
+
+def test_index_moves_token_from_url_into_cookie(monkeypatch):
+    monkeypatch.setattr(toolkit_web, "ACCESS_TOKEN", "abc123")
+    response = toolkit_web.app.test_client().get("/?token=abc123")
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/")
+    assert "token=" not in response.headers["Location"]
+    assert "mt_token=abc123" in response.headers["Set-Cookie"]
+
+
+def test_cookie_alone_is_enough_after_redirect(monkeypatch):
+    monkeypatch.setattr(toolkit_web, "ACCESS_TOKEN", "abc123")
+    client = toolkit_web.app.test_client()
+    client.set_cookie("mt_token", "abc123")
+
+    assert client.get("/").status_code == 200
+
+
+# ---------------------------------------------------------------- job lock
+
+def test_job_refuses_to_start_while_pipeline_lock_is_held():
+    import music_pipeline as mp
+
+    holder = mp.PipelineLock().acquire()
+    try:
+        job = toolkit_web.Job("dupes")
+        try:
+            job.start(lambda: None)
+        except toolkit_web.JobBusy:
+            pass
+        else:
+            raise AssertionError("expected JobBusy")
+        assert not job.running
+    finally:
+        holder.release()
+
+
+def test_job_releases_lock_when_it_finishes():
+    import music_pipeline as mp
+
+    job = toolkit_web.Job("plex")
+    job.start(lambda: None)
+    job.thread.join(timeout=5)
+
+    lock = mp.PipelineLock().acquire()   # would raise PipelineBusy if the job still held it
+    lock.release()
+
+
+def test_dupes_scan_endpoint_returns_409_when_locked(tmp_path):
+    import music_pipeline as mp
+
+    holder = mp.PipelineLock().acquire()
+    try:
+        response = toolkit_web.app.test_client().post("/api/dupes/scan", json={"dupes_folder": str(tmp_path)})
+        assert response.status_code == 409
+    finally:
+        holder.release()
