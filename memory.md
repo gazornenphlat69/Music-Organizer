@@ -7,7 +7,7 @@ Local music/media library toolkit with three front ends sharing one engine:
 - `music_toolkit.py` — desktop Tkinter app
 - `toolkit_web.py` — Flask web app + `web/` (HTML/CSS/JS)
 
-No git repo. Working dir: `C:\Users\Bobu\Downloads\Music Organizer`.
+Source of truth: GitHub repo `gazornenphlat69/Music-Organizer` (work on a branch, open a PR). The synced local copy at `T:\sync\PROJECTS\music_toolkit` is a plain copy with no `.git`. Older notes referred to `C:\Users\Bobu\Downloads\Music Organizer`; that path is obsolete.
 
 ## Key paths / constants
 - Default output dirs (hardcoded in `music_pipeline.py`, overridable via settings): `M:\TO SORT\AAA_CUE`, `M:\sort_script\aaa_complete`, `aaa_incomplete`, `aaa_delete`.
@@ -52,7 +52,8 @@ Current theme: "Midnight Categorical Dashboard" (dark, adopted 2026-11-02, repla
 
 ## Testing
 - `pytest.ini`: `testpaths = tests`. `tests/conftest.py` stubs `musicbrainzngs`, `tqdm`, `mutagen` if missing.
-- Run: `python -m pytest -q` → **50 passed**.
+- Run: `python -m pytest -q` → **69 passed** (2026-11-20, after the token, Waitress and job-lock changes). `pyflakes` clean; `node --check web/app.js` clean.
+- Tests cover the access-token check, the token redirect and in-process job locking (added 2026-11-20). Cross-process lock contention is not tested.
 - Test files: `test_music_pipeline.py`, `test_toolkit_core.py`, `test_toolkit_web.py`.
 - Optional deps in dev: `requirements-dev.txt` (core + pytest + flask).
 
@@ -79,6 +80,9 @@ Current theme: "Midnight Categorical Dashboard" (dark, adopted 2026-11-02, repla
 - Restyled both UIs to Ember Pill Mobile.
 
 ## Known limitations
+- **Flask dev server (resolved 2026-11-20).** `toolkit_web.py` now serves with Waitress (8 threads) when it is installed (`requirements-optional.txt`). It falls back to the Flask dev server with a printed hint otherwise.
+- **Access token in URL (resolved 2026-11-20).** A valid `?token=` on `/` sets the HttpOnly, SameSite=Strict cookie (30 days) and redirects to a clean URL, so the token leaves the address bar and history. `check_token` compares UTF-8 bytes, so non-ASCII input returns 403 instead of a 500. The token can still appear in shell history if passed via `--token`, and in the startup printout.
+- **Partial locking (resolved 2026-11-20).** Every web job except the pipeline takes the same `PipelineLock` that `run_pipeline` uses (duplicate scan, tag health, review scan/recheck/move, Plex scan and apply). A job that can't get the lock returns HTTP 409. Quick synchronous endpoints do not take the lock: dupes delete, review accept/dismiss, and Plex connect. A pipeline run can overlap those.
 - Default paths derive from `LIBRARY_ROOT` (`M:/`); every location is set in the Settings tab.
 - `MB_CONTACT` still has its placeholder default. Set the MusicBrainz contact in Settings; the cleanup step refuses the placeholder.
 - The Discogs token is stored in the settings file only when "Remember token on disk" is on. Otherwise it lasts for the session.

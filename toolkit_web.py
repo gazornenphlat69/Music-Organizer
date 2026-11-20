@@ -27,7 +27,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory
 
 import music_pipeline as mp
 import toolkit_core as core
@@ -142,6 +142,10 @@ HUB = Hub()
 # Jobs
 # =============================================================================
 
+class JobBusy(RuntimeError):
+    """Raised when a job can't start because another job holds the shared pipeline lock."""
+
+
 class Job:
     def __init__(self, name):
         self.name, self.cancel, self.thread = name, threading.Event(), None
@@ -155,6 +159,16 @@ class Job:
     def start(self, fn, *args):
         if self.running:
             raise RuntimeError(f"{self.name} is already running")
+        # Every job except the pipeline takes the same lock run_pipeline uses, so a duplicate scan,
+        # Plex apply or review can't overlap a pipeline run (CLI, desktop or web). The pipeline
+        # takes the lock itself inside run_pipeline.
+        lock = None
+        if self.name != "pipeline":
+            lock = mp.PipelineLock()
+            try:
+                lock.acquire()
+            except mp.PipelineBusy as e:
+                raise JobBusy(str(e)) from e
         self.cancel.clear()
 
         def wrap():
@@ -165,10 +179,13 @@ class Job:
                 import traceback
                 traceback.print_exc(file=sys.__stderr__)
                 err = repr(e)
-                if not self.post_done:
-                    HUB.post(f"{self.name}_done", err)
+            finally:
+                if lock is not None:
+                    lock.release()
             if self.post_done:
                 HUB.post(f"{self.name}_done", err, self.cancel.is_set())
+            elif err is not None:
+                HUB.post(f"{self.name}_done", err)
 
         self.thread = threading.Thread(target=wrap, daemon=True)
         self.thread.start()
@@ -862,18 +879,37 @@ def events():
 # Pages + access control
 # =============================================================================
 
+@app.errorhandler(JobBusy)
+def _job_busy(e):
+    return jsonify(error=str(e)), 409
+
+
+def _token_ok(supplied) -> bool:
+    # compare_digest raises TypeError on non-ASCII str, so compare the UTF-8 bytes instead.
+    if not supplied:
+        return False
+    return secrets.compare_digest(str(supplied).encode("utf-8"), ACCESS_TOKEN.encode("utf-8"))
+
+
 @app.before_request
 def check_token():
     if not ACCESS_TOKEN:
         return
     supplied = request.args.get("token") or request.headers.get("X-Token") or request.cookies.get("mt_token")
-    if not supplied or not secrets.compare_digest(supplied, ACCESS_TOKEN):
+    if not _token_ok(supplied):
         return Response("This music toolkit needs its access link (with ?token=…). "
                         "It is printed in the window where the server is running.", 403)
 
 
 @app.get("/")
 def index():
+    if ACCESS_TOKEN and request.args.get("token"):
+        # The link's token has been checked. Move it into the cookie and redirect to a clean URL, so it
+        # doesn't stay in the address bar or browser history.
+        resp = redirect("/")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.set_cookie("mt_token", ACCESS_TOKEN, httponly=True, samesite="Strict", max_age=60 * 60 * 24 * 30)
+        return resp
     resp = send_from_directory(WEB_DIR, "index.html")
     resp.headers["Cache-Control"] = "no-cache"
     if ACCESS_TOKEN:
@@ -922,7 +958,15 @@ def main():
     print("Press Ctrl+C to stop.")
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    app.run(host=host, port=args.port, threaded=True, debug=False, use_reloader=False)
+    try:
+        from waitress import serve               # production WSGI server (requirements-optional.txt)
+    except ImportError:
+        serve = None
+    if serve is not None:
+        serve(app, host=host, port=args.port, threads=8)
+    else:
+        print("Waitress is not installed; using the Flask development server. Run: pip install waitress")
+        app.run(host=host, port=args.port, threaded=True, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
