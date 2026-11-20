@@ -52,8 +52,8 @@ Current theme: "Midnight Categorical Dashboard" (dark, adopted 2026-11-02, repla
 
 ## Testing
 - `pytest.ini`: `testpaths = tests`. `tests/conftest.py` stubs `musicbrainzngs`, `tqdm`, `mutagen` if missing.
-- Run: `python -m pytest -q` → **69 passed** (2026-11-20, after the token, Waitress and job-lock changes). `pyflakes` clean; `node --check web/app.js` clean.
-- Tests cover the access-token check, the token redirect and in-process job locking (added 2026-11-20). Cross-process lock contention is not tested.
+- Run: `python -m pytest -q` → **72 passed** (2026-11-20, after the token, Waitress, job-lock and quick-endpoint changes). `pyflakes` clean; `node --check web/app.js` clean.
+- Tests cover the access-token check, the token redirect, in-process job locking, locked quick endpoints and cross-process lock refusal (added 2026-11-20).
 - Test files: `test_music_pipeline.py`, `test_toolkit_core.py`, `test_toolkit_web.py`.
 - Optional deps in dev: `requirements-dev.txt` (core + pytest + flask).
 
@@ -81,8 +81,8 @@ Current theme: "Midnight Categorical Dashboard" (dark, adopted 2026-11-02, repla
 
 ## Known limitations
 - **Flask dev server (resolved 2026-11-20).** `toolkit_web.py` now serves with Waitress (8 threads) when it is installed (`requirements-optional.txt`). It falls back to the Flask dev server with a printed hint otherwise.
-- **Access token in URL (resolved 2026-11-20).** A valid `?token=` on `/` sets the HttpOnly, SameSite=Strict cookie (30 days) and redirects to a clean URL, so the token leaves the address bar and history. `check_token` compares UTF-8 bytes, so non-ASCII input returns 403 instead of a 500. The token can still appear in shell history if passed via `--token`, and in the startup printout.
-- **Partial locking (resolved 2026-11-20).** Every web job except the pipeline takes the same `PipelineLock` that `run_pipeline` uses (duplicate scan, tag health, review scan/recheck/move, Plex scan and apply). A job that can't get the lock returns HTTP 409. Quick synchronous endpoints do not take the lock: dupes delete, review accept/dismiss, and Plex connect. A pipeline run can overlap those.
+- **Access token in URL (resolved 2026-11-20).** A valid `?token=` on `/` sets the HttpOnly, SameSite=Strict cookie (30 days) and redirects to a clean URL, so the token leaves the address bar and history. `check_token` compares UTF-8 bytes, so non-ASCII input returns 403 instead of a 500. `MUSIC_TOOLKIT_TOKEN` (environment variable) sets the token without it appearing in shell history; `--token` still works but does. The startup printout shows the link by design.
+- **Partial locking (resolved 2026-11-20).** Every web job except the pipeline takes the same `PipelineLock` that `run_pipeline` uses (duplicate scan, tag health, review scan/recheck/move, Plex scan and apply). A job that can't get the lock returns HTTP 409. Quick endpoints that change files or the Plex library also take the lock through the `@locked` decorator: dupes delete, review accept/dismiss, and Plex connect.
 - Default paths derive from `LIBRARY_ROOT` (`M:/`); every location is set in the Settings tab.
 - `MB_CONTACT` still has its placeholder default. Set the MusicBrainz contact in Settings; the cleanup step refuses the placeholder.
 - The Discogs token is stored in the settings file only when "Remember token on disk" is on. Otherwise it lasts for the session.

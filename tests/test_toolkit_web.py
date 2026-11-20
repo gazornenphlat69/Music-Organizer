@@ -167,3 +167,46 @@ def test_dupes_scan_endpoint_returns_409_when_locked(tmp_path):
         assert response.status_code == 409
     finally:
         holder.release()
+
+
+def test_quick_endpoints_return_409_while_lock_is_held():
+    import music_pipeline as mp
+
+    client = toolkit_web.app.test_client()
+    holder = mp.PipelineLock().acquire()
+    try:
+        assert client.post("/api/dupes/delete", json={"ids": []}).status_code == 409
+        assert client.post("/api/review/dismiss", json={"key": "x"}).status_code == 409
+        assert client.post("/api/plex/connect", json={}).status_code == 409
+    finally:
+        holder.release()
+
+
+def test_quick_endpoint_runs_when_lock_is_free():
+    response = toolkit_web.app.test_client().post("/api/review/dismiss", json={"key": "does-not-exist"})
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+
+
+def test_lock_is_refused_by_another_process(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import music_pipeline as mp
+
+    repo = Path(mp.__file__).resolve().parent
+    code = ("import sys; import music_pipeline as mp\n"
+            "try:\n    lock = mp.PipelineLock().acquire()\nexcept mp.PipelineBusy:\n    sys.exit(3)\n"
+            "lock.release()\nsys.exit(0)\n")
+    holder = mp.PipelineLock().acquire()
+    try:
+        result = subprocess.run([sys.executable, "-c", code], cwd=repo, capture_output=True, timeout=60)
+        assert result.returncode == 3, result.stderr.decode(errors="replace")
+    finally:
+        holder.release()
+
+    # With the lock released, the other process can take it.
+    result = subprocess.run([sys.executable, "-c", code], cwd=repo, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")

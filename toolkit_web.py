@@ -14,6 +14,7 @@ Files    : toolkit_web.py, toolkit_core.py, music_pipeline.py and the web/ folde
 """
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -144,6 +145,24 @@ HUB = Hub()
 
 class JobBusy(RuntimeError):
     """Raised when a job can't start because another job holds the shared pipeline lock."""
+
+
+def locked(view):
+    """Hold the shared pipeline lock for a quick endpoint that changes files or the Plex library,
+    so it can't run alongside a pipeline job, a duplicate scan, a review or a Plex apply.
+    Returns 409 if the lock is busy."""
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        lock = mp.PipelineLock()
+        try:
+            lock.acquire()
+        except mp.PipelineBusy as e:
+            raise JobBusy(str(e)) from e
+        try:
+            return view(*args, **kwargs)
+        finally:
+            lock.release()
+    return wrapper
 
 
 class Job:
@@ -372,6 +391,7 @@ def dupes_export():
 
 
 @app.post("/api/dupes/delete")
+@locked
 def dupes_delete():
     ids = body().get("ids") or []
     trash = bool(SETTINGS.get("use_trash")) and core.send2trash is not None
@@ -555,6 +575,7 @@ def review_lookup():
 
 
 @app.post("/api/review/accept")
+@locked
 def review_accept():
     b = body()
     entries = _review_entries()
@@ -573,6 +594,7 @@ def review_accept():
 
 
 @app.post("/api/review/dismiss")
+@locked
 def review_dismiss():
     entries = _review_entries()
     entries.pop(body().get("key"), None)
@@ -661,6 +683,7 @@ def plex_log(s):
 
 
 @app.post("/api/plex/connect")
+@locked
 def plex_connect():
     b = body()
     settings_update(b)
@@ -940,7 +963,8 @@ def main():
     ap = argparse.ArgumentParser(description="Web front end for the music toolkit")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--lan", action="store_true", help="listen on the network (phone, other PCs); needs the token link")
-    ap.add_argument("--token", help="access token to use with --lan (default: random each start)")
+    ap.add_argument("--token", help="access token to use with --lan (default: random each start). "
+                                    "Prefer the MUSIC_TOOLKIT_TOKEN environment variable, which stays out of shell history.")
     ap.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
     args = ap.parse_args()
 
@@ -951,7 +975,7 @@ def main():
     url = f"http://127.0.0.1:{args.port}/"
     print(f"Music Toolkit web app: {url}")
     if args.lan:
-        ACCESS_TOKEN = args.token or secrets.token_urlsafe(12)
+        ACCESS_TOKEN = args.token or os.environ.get("MUSIC_TOOLKIT_TOKEN") or secrets.token_urlsafe(12)
         print(f"From your phone or another PC (same network): http://{lan_ip()}:{args.port}/?token={ACCESS_TOKEN}")
         print("Anyone with that link can move and delete your files; don't share it.")
         url += f"?token={ACCESS_TOKEN}"
