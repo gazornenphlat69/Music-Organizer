@@ -94,7 +94,8 @@ embedart:
 
 lyrics:
   auto: yes                 # fetch lyrics during import and write them into the tags
-  synced: no                # plain lyrics only; time-synced .lrc files need keep_synced
+  synced: yes               # ask for time-synced lyrics; falls back to plain text when a source has none
+  keep_synced: yes          # don't replace a file's existing synced lyrics with plain ones
   force: no                 # keep lyrics a file already has
   sources: [lrclib, genius] # Google needs an API key and Musixmatch/Tekstowo block beets (see plugin defaults)
 
