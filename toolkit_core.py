@@ -20,6 +20,9 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import mutagen
 import music_pipeline as mp
@@ -787,6 +790,7 @@ def default_settings() -> dict:
         dupes_folder="", dupes_priority=next(iter(PRIORITIES)), dupes_mode=next(iter(MODES)),
         dupes_duration=True, dupes_fp=False,
         health_folder="", health_only_issues=True,
+        lyrics_folder="", lyrics_prefer_synced=True, lyrics_overwrite=False,
         review_write_tags=True, review_scan_incomplete=True,
         plex_url=os.environ.get("PLEX_BASEURL", "http://localhost:32400"),
         plex_token=os.environ.get("PLEX_TOKEN", ""), plex_remember_token=False, plex_tags=DEFAULT_TAGS,
@@ -1128,3 +1132,185 @@ def history_today(history, limit=500) -> list[str]:
         return lines[-limit:]
     except Exception:
         return []
+
+
+# =============================================================================
+# Lyrics: LRCLIB lookup, reading and writing lyrics tags (used by the Lyrics tab)
+# =============================================================================
+LRCLIB_API = "https://lrclib.net/api"
+LRCLIB_USER_AGENT = "music-toolkit (https://github.com/gazornenphlat69/Music-Organizer)"
+LYRICS_DURATION_TOLERANCE_S = 3.0
+LYRICS_EXTENSIONS = {".mp3", ".flac", ".ogg", ".opus", ".m4a"}
+
+
+class LyricsNetworkError(RuntimeError):
+    """LRCLIB could not be reached or returned an error. Such lookups are not cached or treated as 'no lyrics'."""
+
+
+def _lrclib_get_json(path, params, timeout=15):
+    """GET a LRCLIB endpoint. Returns the decoded JSON, or None on HTTP 404."""
+    req = Request(f"{LRCLIB_API}/{path}?{urlencode(params)}", headers={"User-Agent": LRCLIB_USER_AGENT})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        if e.code == 404:
+            return None
+        raise LyricsNetworkError(f"LRCLIB returned HTTP {e.code}") from e
+    except (URLError, OSError, ValueError) as e:
+        raise LyricsNetworkError(f"LRCLIB request failed: {e}") from e
+
+
+def _has_text(hit):
+    return bool((hit.get("plainLyrics") or "").strip() or (hit.get("syncedLyrics") or "").strip())
+
+
+def lrclib_lookup(artist, title, album="", duration=None):
+    """Best LRCLIB match for a track, or None. Tries an exact /get first, then /search with a duration check.
+    Instrumental tracks and results with no lyrics text are treated as no match."""
+    if not artist or not title:
+        return None
+    base = {"artist_name": artist, "track_name": title}
+    get_params = dict(base)
+    if album:
+        get_params["album_name"] = album
+    if duration:
+        get_params["duration"] = int(round(duration))
+    hit = _lrclib_get_json("get", get_params)
+    if hit and _has_text(hit):
+        return hit
+    for cand in _lrclib_get_json("search", base) or []:
+        if not _has_text(cand):
+            continue
+        d = cand.get("duration")
+        if duration and d is not None and abs(float(d) - float(duration)) > LYRICS_DURATION_TOLERANCE_S:
+            continue
+        return cand
+    return None
+
+
+def pick_lyrics_text(hit, prefer_synced=True):
+    """(text, is_synced) from a LRCLIB hit. Synced lyrics are used when preferred and available."""
+    synced = (hit.get("syncedLyrics") or "").strip()
+    plain = (hit.get("plainLyrics") or "").strip()
+    if prefer_synced and synced:
+        return synced, True
+    if plain:
+        return plain, False
+    if synced:
+        return synced, True
+    return None, False
+
+
+def read_existing_lyrics(fp: Path) -> bool:
+    """True if the file already has non-empty lyrics text in its tags."""
+    f = mutagen.File(fp)
+    if f is None or f.tags is None:
+        return False
+    ext = Path(fp).suffix.lower()
+    if ext == ".mp3":
+        frames = f.tags.getall("USLT") if hasattr(f.tags, "getall") else []
+        return any((fr.text or "").strip() for fr in frames)
+    if ext == ".m4a":
+        return any(str(v).strip() for v in (f.tags.get("\xa9lyr") or []))
+    return any(str(v).strip() for v in (f.tags.get("LYRICS") or []))
+
+
+def write_lyrics(fp: Path, text: str) -> None:
+    """Store lyrics text in the file's tags, replacing any existing lyrics. Synced lyrics go in the same
+    tag as LRC-timestamped text, the way beets stores them. Unsupported formats raise ValueError."""
+    ext = Path(fp).suffix.lower()
+    if ext not in LYRICS_EXTENSIONS:
+        raise ValueError(f"lyrics aren't supported for {ext} files")
+    f = mutagen.File(fp)
+    if f is None:
+        raise ValueError("not a readable audio file")
+    if f.tags is None:
+        f.add_tags()
+    if ext == ".mp3":
+        from mutagen.id3 import USLT
+        f.tags.delall("USLT")
+        f.tags.add(USLT(encoding=3, lang="eng", desc="", text=text))
+    elif ext == ".m4a":
+        f.tags["\xa9lyr"] = [text]
+    else:
+        f.tags["LYRICS"] = [text]
+    f.save()
+
+
+def _read_track_meta(fp: Path):
+    f = mutagen.File(fp, easy=True)
+    if f is None:
+        raise ValueError("not a readable audio file")
+    get = lambda k: (f.get(k) or [""])[0] if f.tags else ""  # noqa: E731
+    duration = round(f.info.length, 1) if f.info else None
+    return {"artist": get("artist") or get("albumartist"), "title": get("title"),
+            "album": get("album"), "duration": duration}
+
+
+def lyrics_scan(root: Path, prefer_synced=True, overwrite=False, progress=None, cancel=None,
+                lookup=lrclib_lookup):
+    """Check every supported audio file under root and look up lyrics for those that need them.
+
+    Returns (items, texts): items are dicts describing each file (status is one of has_lyrics, found,
+    not_found, error); texts maps item id -> the lyrics text that Apply would write. Nothing is written here.
+    """
+    files = sorted(Path(dp) / n for dp, _, fs in os.walk(root) for n in fs
+                   if Path(n).suffix.lower() in LYRICS_EXTENSIONS and ".partial." not in n)
+    items, texts = [], {}
+    for i, fp in enumerate(files):
+        if cancel and cancel.is_set():
+            break
+        if progress:
+            progress(i + 1, len(files), fp.name)
+        item = {"id": str(i), "path": str(fp), "name": fp.name, "artist": "", "title": "", "album": "",
+                "duration": None, "status": "error", "synced": False, "replaces": False, "message": ""}
+        items.append(item)
+        try:
+            meta = _read_track_meta(fp)
+            item.update(meta)
+            existing = read_existing_lyrics(fp)
+            if existing and not overwrite:
+                item.update(status="has_lyrics", message="already has lyrics")
+                continue
+            if not meta["artist"] or not meta["title"]:
+                item.update(status="not_found", message="needs artist and title tags to look up lyrics")
+                continue
+            hit = lookup(meta["artist"], meta["title"], meta["album"], meta["duration"])
+            text, synced = pick_lyrics_text(hit, prefer_synced) if hit else (None, False)
+            if not text:
+                item.update(status="not_found", message="no lyrics on LRCLIB")
+                continue
+            texts[item["id"]] = text
+            item.update(status="found", synced=synced, replaces=existing,
+                        message="replaces existing lyrics" if existing else "")
+        except LyricsNetworkError as e:
+            item.update(status="error", message=str(e))
+        except Exception as e:
+            item.update(status="error", message=f"could not read file: {e}")
+    return items, texts
+
+
+def lyrics_apply(items, texts, dry_run=True, history=None, progress=None, cancel=None):
+    """Write the found lyrics into their files. Returns (done_ids, errors). Dry run reports without writing."""
+    targets = [it for it in items if it["status"] == "found" and it["id"] in texts]
+    done, errors = [], []
+    for i, it in enumerate(targets):
+        if cancel and cancel.is_set():
+            break
+        fp = Path(it["path"])
+        if progress:
+            progress(i + 1, len(targets), fp.name)
+        if dry_run:
+            done.append(it["id"])
+            continue
+        try:
+            write_lyrics(fp, texts[it["id"]])
+            if not read_existing_lyrics(fp):
+                raise RuntimeError("lyrics did not save")
+            if history is not None:
+                history.write("lyrics", "write", str(fp))
+            done.append(it["id"])
+        except Exception as e:
+            errors.append(f"{fp.name}: {e}")
+    return done, errors

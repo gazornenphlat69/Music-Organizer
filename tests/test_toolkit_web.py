@@ -40,7 +40,7 @@ def test_web_app_state_endpoint():
     data = response.get_json()
     assert "jobs" in data
     assert "pipeline" in data
-    assert set(data["jobs"]) == {"pipeline", "dupes", "health", "review", "plex"}
+    assert set(data["jobs"]) == {"pipeline", "dupes", "health", "review", "plex", "lyrics"}
 
 
 def test_web_app_settings_endpoint():

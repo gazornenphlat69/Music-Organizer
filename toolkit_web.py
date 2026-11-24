@@ -85,7 +85,7 @@ class Hub:
     so a 6-worker conversion doesn't send hundreds of messages a second."""
 
     COALESCE = {"slot", "overall", "beets_progress", "dupes_progress", "health_progress",
-                "review_progress", "plex_progress"}
+                "review_progress", "plex_progress", "lyrics_progress"}
 
     def __init__(self):
         self.clients: list[queue.Queue] = []
@@ -195,7 +195,7 @@ class Job:
         HUB.post(f"{self.name}_progress", n, max(t, 1), label)
 
 
-JOBS = {n: Job(n) for n in ("pipeline", "dupes", "health", "review", "plex")}
+JOBS = {n: Job(n) for n in ("pipeline", "dupes", "health", "review", "plex", "lyrics")}
 
 
 def busy(name):
@@ -459,6 +459,75 @@ def health_get():
 def health_csv():
     return Response(core.health_csv(HEALTH["results"]), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=tag_health.csv"})
+
+
+# =============================================================================
+# Lyrics
+# =============================================================================
+
+LYRICS = {"items": [], "texts": {}, "apply": None}
+
+
+def _lyrics_scan_job(root, prefer_synced, overwrite):
+    job = JOBS["lyrics"]
+    items, texts = core.lyrics_scan(root, prefer_synced, overwrite, progress=job.report, cancel=job.cancel)
+    LYRICS.update(items=items, texts=texts, apply=None)
+
+
+def _lyrics_apply_job(ids, dry):
+    job = JOBS["lyrics"]
+    chosen = [i for i in LYRICS["items"] if i["id"] in ids]
+    done, errors = core.lyrics_apply(chosen, LYRICS["texts"], dry_run=dry, history=HISTORY,
+                                     progress=job.report, cancel=job.cancel)
+    done_set = set(done)
+    if not dry:
+        for it in LYRICS["items"]:
+            if it["id"] in done_set:
+                it.update(status="has_lyrics", replaces=False, message="lyrics written")
+        for iid in done_set:
+            LYRICS["texts"].pop(iid, None)
+    LYRICS["apply"] = {"dry": dry, "done": len(done), "errors": errors}
+
+
+@app.post("/api/lyrics/scan")
+def lyrics_scan():
+    job = JOBS["lyrics"]
+    if job.running:
+        return busy("Lyrics")
+    b = body()
+    settings_update(b)
+    root = Path(str(b.get("lyrics_folder", "")).strip().strip('"'))
+    if not root.is_dir():
+        return jsonify(error="Pick a valid folder first."), 400
+    job.start(_lyrics_scan_job, root, bool(SETTINGS.get("lyrics_prefer_synced")),
+              bool(SETTINGS.get("lyrics_overwrite")))
+    return jsonify(ok=True)
+
+
+@app.post("/api/lyrics/apply")
+def lyrics_apply():
+    job = JOBS["lyrics"]
+    if job.running:
+        return busy("Lyrics")
+    b = body()
+    ids = [str(i) for i in (b.get("ids") or []) if str(i) in LYRICS["texts"]]
+    if not ids:
+        return jsonify(error="Nothing to apply. Scan first, then tick the tracks you want."), 400
+    job.start(_lyrics_apply_job, ids, bool(b.get("dry_run", True)))
+    return jsonify(ok=True)
+
+
+@app.post("/api/lyrics/stop")
+def lyrics_stop():
+    JOBS["lyrics"].cancel.set()
+    return jsonify(ok=True)
+
+
+@app.get("/api/lyrics")
+def lyrics_get():
+    items = [{k: v for k, v in it.items()} for it in LYRICS["items"]]
+    return jsonify(items=items, found=len(LYRICS["texts"]), running=JOBS["lyrics"].running,
+                   progress=JOBS["lyrics"].progress, apply=LYRICS["apply"])
 
 
 # =============================================================================
