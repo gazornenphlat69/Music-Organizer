@@ -864,6 +864,160 @@ class TagHealthTab(ttk.Frame):
 
 
 
+class LyricsTab(ttk.Frame):
+    """Fetch lyrics from LRCLIB for tracks that have none and write the ones you pick into the files.
+    The lookup and tag writing live in toolkit_core; this tab only collects choices and shows results."""
+
+    STATUS_TEXT = {"found": "Found", "has_lyrics": "Has lyrics", "not_found": "Not found", "error": "Error"}
+
+    def __init__(self, master, bus, settings: Settings):
+        super().__init__(master, padding=10)
+        self.bus, self.settings_obj, self.cancel = bus, settings, threading.Event()
+        self.items, self.texts = [], {}
+        self.folder = settings.bind("lyrics_folder", tk.StringVar())
+        self.prefer_synced = settings.bind("lyrics_prefer_synced", tk.BooleanVar(value=True))
+        self.overwrite = settings.bind("lyrics_overwrite", tk.BooleanVar(value=False))
+        self.dry = tk.BooleanVar(value=True)            # never persisted: a live write needs an explicit untick
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        top.columnconfigure(1, weight=1)
+        folder_row(top, "Music folder:", self.folder, 0)
+        opts = ttk.Frame(self)
+        opts.pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(opts, text="Prefer synced lyrics", variable=self.prefer_synced).pack(side="left")
+        ttk.Checkbutton(opts, text="Replace existing lyrics", variable=self.overwrite).pack(side="left", padx=8)
+        b = ttk.Frame(self)
+        b.pack(fill="x", pady=8)
+        self.scan_btn = ttk.Button(b, text="🔍 Scan", command=self.scan)
+        self.scan_btn.pack(side="left")
+        self.stop_btn = ttk.Button(b, text="■ Stop", command=self.cancel.set, state="disabled")
+        self.stop_btn.pack(side="left", padx=4)
+        ttk.Checkbutton(b, text="Dry run (change nothing)", variable=self.dry).pack(side="left", padx=8)
+        self.apply_btn = ttk.Button(b, text="Write selected", style="Accent.TButton", command=self.apply,
+                                    state="disabled")
+        self.apply_btn.pack(side="right")
+
+        self.summary = ttk.Label(self, text="Select rows (Ctrl/Shift-click) to choose which tracks get lyrics. "
+                                            "Found rows are selected after a scan.")
+        self.summary.pack(fill="x")
+        self.progress = ttk.Progressbar(self, maximum=1)
+        self.progress.pack(fill="x", pady=(2, 6))
+
+        cols = (("status", 110), ("artist", 160), ("title", 220), ("album", 200), ("note", 240))
+        self.tree = ttk.Treeview(self, columns=[c for c, _ in cols], show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="File")
+        self.tree.column("#0", width=200)
+        for c, w in cols:
+            self.tree.heading(c, text=c.title())
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.tag_configure("found", foreground=T["success"])
+        self.tree.tag_configure("bad", foreground=T["error"])
+        self.tree.tag_configure("muted", foreground=T["muted"])
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        bus.on("lyrics_progress", lambda n, t, label: self.progress.configure(maximum=max(t, 1), value=n))
+        bus.on("lyrics_scanned", self._scanned)
+        bus.on("lyrics_applied", self._applied)
+
+    def scan(self):
+        root = Path(self.folder.get().strip().strip('"'))
+        if not root.is_dir():
+            messagebox.showerror("Lyrics", "Pick a valid folder first.")
+            return
+        prefer, overwrite = self.prefer_synced.get(), self.overwrite.get()   # read Tk vars on the main thread
+        self.cancel.clear()
+        self.scan_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.apply_btn.configure(state="disabled")
+
+        def work():
+            try:
+                items, texts = core.lyrics_scan(
+                    root, prefer, overwrite,
+                    progress=lambda n, t, label: self.bus.post("lyrics_progress", n, t, label),
+                    cancel=self.cancel)
+                self.bus.post("lyrics_scanned", items, texts, None)
+            except Exception as e:
+                self.bus.post("lyrics_scanned", [], {}, repr(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _scanned(self, items, texts, err):
+        self.scan_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.items, self.texts = items, texts
+        self._render(select_found=True)
+        if err:
+            self.summary.configure(text=f"Scan failed: {err}")
+
+    def apply(self):
+        chosen_ids = [iid for iid in self.tree.selection() if self._item(iid) and self._item(iid)["status"] == "found"]
+        if not chosen_ids:
+            messagebox.showinfo("Lyrics", "Select at least one Found row.")
+            return
+        dry = self.dry.get()                        # Tk var read on the main thread
+        chosen = [self._item(i) for i in chosen_ids]
+        self.cancel.clear()
+        self.apply_btn.configure(state="disabled")
+        self.scan_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+        def work():
+            try:
+                done, errors = core.lyrics_apply(
+                    chosen, self.texts, dry_run=dry, history=self.settings_obj.history,
+                    progress=lambda n, t, label: self.bus.post("lyrics_progress", n, t, label),
+                    cancel=self.cancel)
+                self.bus.post("lyrics_applied", done, errors, dry, None)
+            except Exception as e:
+                self.bus.post("lyrics_applied", [], [], dry, repr(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _applied(self, done, errors, dry, err):
+        self.scan_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        done_set = set(done)
+        if not dry:
+            for it in self.items:
+                if it["id"] in done_set:
+                    it.update(status="has_lyrics", replaces=False, message="lyrics written")
+                    self.texts.pop(it["id"], None)
+        self._render(select_found=False)
+        if err:
+            self.summary.configure(text=f"Write failed: {err}")
+            return
+        extra = f" {len(errors)} failed: " + "; ".join(errors[:3]) if errors else ""
+        verb = "would get lyrics (dry run, nothing changed)" if dry else "wrote lyrics to"
+        self.summary.configure(text=f"{len(done)} file(s) {verb}.{extra}")
+
+    def _item(self, iid):
+        return next((i for i in self.items if i["id"] == iid), None)
+
+    def _render(self, select_found=False):
+        self.tree.delete(*self.tree.get_children())
+        for it in self.items:
+            tag = {"found": "found", "error": "bad"}.get(it["status"], "muted" if it["status"] == "has_lyrics" else "")
+            note = "; ".join(x for x in (it.get("message") or "", "synced" if it.get("synced") else "") if x)
+            self.tree.insert("", "end", iid=it["id"], text=it["name"], tags=(tag,),
+                             values=(self.STATUS_TEXT.get(it["status"], it["status"]), it.get("artist", ""),
+                                     it.get("title", ""), it.get("album", ""), note))
+        if select_found:
+            found = [it["id"] for it in self.items if it["status"] == "found"]
+            self.tree.selection_set(found)
+        counts = defaultdict(int)
+        for it in self.items:
+            counts[it["status"]] += 1
+        self.apply_btn.configure(state="normal" if counts["found"] else "disabled")
+        self.summary.configure(text=f"{len(self.items)} file(s) · " + " · ".join(
+            f"{self.STATUS_TEXT.get(k, k)}: {v}" for k, v in sorted(counts.items())) if self.items else
+            "No audio files found in that folder.")
+
+
 class ReviewTab(ttk.Frame):
     """
     Works through mb_unmatched.json: folders the pipeline sent to Incomplete (or sorted on tags alone)
@@ -1642,7 +1796,8 @@ def main():
     nb.pack(fill="both", expand=True, padx=12, pady=(4, 12))
     pipeline = PipelineTab(nb, bus, settings)
     tabs = [(pipeline, "Pipeline"), (DupesTab(nb, bus, settings), "Duplicates"),
-            (TagHealthTab(nb, bus, settings), "Tag health"), (ReviewTab(nb, bus, settings), "Review"),
+            (TagHealthTab(nb, bus, settings), "Tag health"), (LyricsTab(nb, bus, settings), "Lyrics"),
+            (ReviewTab(nb, bus, settings), "Review"),
             (PlexTab(nb, bus, settings), "Plex"),
             (SettingsTab(nb, bus, settings), "Settings")]
     for tab, name in tabs:

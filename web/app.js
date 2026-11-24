@@ -136,6 +136,7 @@ const S = {
   pipe: { running: false, stopping: false, dry: true, slots: [], overall: null, beets: null, question: null },
   dupes: { groups: [], ticked: new Set(), shown: 60, running: false, progress: null, loaded: false, priorities: [], modes: [] },
   health: { results: [], filter: "issues", running: false, loaded: false },
+  lyrics: { items: [], filter: "found", running: false, loaded: false, progress: null, apply: null, dry: true, ticked: new Set(), tickFresh: false },
   review: { entries: [], selected: null, filter: "all", running: false, loaded: false },
   plex: { connected: false, name: "", libraries: [], selLibs: new Set(), groups: [], ticked: new Set(), shown: 60, running: false, dry: true, loaded: false },
 };
@@ -159,11 +160,12 @@ const VIEWS = {
   review: ["Review", "Albums MusicBrainz couldn't confirm"],
   more: ["More", "Other tools"],
   health: ["Tag health", "Missing tags, gaps and cover art"],
+  lyrics: ["Lyrics", "Fetch lyrics into your music files"],
   plex: ["Plex", "Duplicate movies and episodes"],
   settings: ["Settings", "Folders, deleting and history"],
   history: ["History", "Everything moved or deleted today"],
 };
-const TAB_FOR = { health: "more", plex: "more", settings: "more", history: "more" };
+const TAB_FOR = { health: "more", lyrics: "more", plex: "more", settings: "more", history: "more" };
 
 function go(view) {
   if (!VIEWS[view]) view = "pipeline";
@@ -173,7 +175,7 @@ function go(view) {
   $("#title").textContent = VIEWS[view][0];
   $("#subtitle").textContent = VIEWS[view][1];
   if (location.hash !== `#${view}`) history.pushState(null, "", `#${view}`);
-  ({ dupes: loadDupes, health: loadHealth, review: loadReview, plex: loadPlex, history: loadHistory }[view] || (() => {}))();
+  ({ dupes: loadDupes, health: loadHealth, lyrics: loadLyrics, review: loadReview, plex: loadPlex, history: loadHistory }[view] || (() => {}))();
   window.scrollTo(0, 0);
 }
 
@@ -619,6 +621,111 @@ function renderHealth() {
     </button>`; }).join("") + (rows.length > 400 ? `<div class="caption">Showing 400 of ${rows.length}. Export the CSV for the full list.</div>` : "");
 }
 
+// ================================================================== LYRICS
+const LY_STATUS = {
+  found: ["c-success", "t-success", "check-circle-bold", "Found"],
+  has_lyrics: ["c-muted", "t-muted", "check-read-bold", "Has lyrics"],
+  not_found: ["c-warning", "t-warning", "danger-triangle-bold", "Not found"],
+  error: ["c-error", "t-error", "danger-circle-bold", "Error"],
+};
+
+function mountLyrics() {
+  $("#view-lyrics").innerHTML = `
+    <div class="card stack">
+      ${folderField("lyrics_folder", "Music folder")}
+      <div class="chips">
+        ${chip("lyrics_prefer_synced", "Prefer synced lyrics", "clock-circle-bold")}
+        ${chip("lyrics_overwrite", "Replace existing lyrics", "refresh-bold")}
+      </div>
+      <div class="btn-pair"><button class="btn primary" id="ly-scan">${ic("magnifer-bold")} Scan</button></div>
+      <div class="progress"><div id="ly-bar"></div></div>
+      <div class="caption" id="ly-status">Looks up lyrics on LRCLIB for tracks without any, then writes the ones you tick.</div>
+    </div>
+    <div class="stats" id="ly-stats"></div>
+    <div class="card-elevated" style="margin-bottom:16px">
+      <div class="row between"><span class="muted" id="ly-ticked">0 ticked</span>
+        <div class="btn-pair">
+          <button class="chip ${S.lyrics.dry ? "active" : ""}" id="ly-dry">${ic("shield-check-bold")}Dry run (change nothing)</button>
+          <button class="btn primary" id="ly-apply" disabled>${ic("tag-bold")} Write lyrics</button>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="section-head"><h3 class="headline-sm">Tracks</h3></div>
+      <div class="chips" id="ly-filters" style="margin-bottom:16px"></div>
+      <div class="list" id="ly-list"></div>
+    </div>`;
+  $("#ly-scan").onclick = () => (S.lyrics.running ? api("/api/lyrics/stop", {}) : api("/api/lyrics/scan", S.settings).then(() => { S.lyrics.running = true; S.lyrics.apply = null; S.lyrics.tickFresh = true; renderLyrics(); }).catch(() => {}));
+  $("#ly-dry").onclick = (e) => { S.lyrics.dry = !S.lyrics.dry; e.currentTarget.classList.toggle("active", S.lyrics.dry); renderLyrics(); };
+  $("#ly-apply").onclick = () => api("/api/lyrics/apply", { ids: [...S.lyrics.ticked], dry_run: S.lyrics.dry }).then(() => { S.lyrics.running = true; renderLyrics(); }).catch(() => {});
+  $("#ly-filters").addEventListener("click", (e) => { const b = e.target.closest("[data-f]"); if (b) { S.lyrics.filter = b.dataset.f; renderLyrics(); } });
+  $("#ly-list").addEventListener("click", (e) => {
+    const r = e.target.closest("[data-tick]"); if (!r) return;
+    const id = r.dataset.tick;
+    S.lyrics.ticked.has(id) ? S.lyrics.ticked.delete(id) : S.lyrics.ticked.add(id);
+    renderLyrics();
+  });
+}
+
+async function loadLyrics() {
+  const d = await api("/api/lyrics");
+  if (!S.lyrics.loaded) { S.lyrics.loaded = true; mountLyrics(); }
+  Object.assign(S.lyrics, { items: d.items, running: d.running, progress: d.progress, apply: d.apply });
+  if (S.lyrics.tickFresh) {                       // a new scan: tick everything that was found
+    S.lyrics.ticked = new Set(d.items.filter((i) => i.status === "found").map((i) => i.id));
+    S.lyrics.tickFresh = false;
+  }
+  renderLyrics();
+}
+
+function renderLyrics() {
+  if (!S.lyrics.loaded) return;
+  const l = S.lyrics, items = l.items;
+  const count = (s) => items.filter((i) => i.status === s).length;
+  const found = count("found");
+  $("#ly-scan").innerHTML = l.running ? `${ic("stop-bold")} Stop` : `${ic("magnifer-bold")} Scan`;
+  $("#ly-bar").style.width = l.running && l.progress ? `${pct(l.progress.n, l.progress.t)}%` : items.length ? "100%" : "0%";
+  if (l.running && l.progress) $("#ly-status").textContent = `Checking ${l.progress.n} of ${l.progress.t}: ${l.progress.label}`;
+  else if (l.apply) {
+    const a = l.apply;
+    const errs = a.errors && a.errors.length ? ` ${a.errors.length} failed.` : "";
+    $("#ly-status").textContent = a.dry ? `Dry run: ${a.done} file(s) would get lyrics. Nothing was changed.` : `Wrote lyrics to ${a.done} file(s).${errs}`;
+  } else if (items.length) $("#ly-status").textContent = "Tick the tracks to write, then apply. Dry run changes nothing.";
+
+  $("#ly-stats").innerHTML = [["Tracks", items.length, ""], ["Found", found, found ? "success" : ""],
+    ["Already have", count("has_lyrics"), ""], ["Not found", count("not_found"), ""],
+    ["Errors", count("error"), count("error") ? "error-text" : ""]]
+    .map(([lbl, n, c]) => `<div class="stat"><div class="caption">${lbl}</div><div class="value ${c}">${n}</div></div>`).join("");
+
+  const ticked = [...l.ticked].filter((id) => items.some((i) => i.id === id && i.status === "found")).length;
+  $("#ly-ticked").textContent = `${ticked} ticked`;
+  $("#ly-dry").classList.toggle("active", l.dry);
+  $("#ly-apply").disabled = l.running || !ticked;
+  $("#ly-apply").innerHTML = `${ic("tag-bold")} ${l.dry ? "Dry-run" : "Write"} ${ticked || ""} ticked`;
+
+  const filters = [["found", `Found (${found})`], ["all", `All (${items.length})`], ["has_lyrics", `Has lyrics (${count("has_lyrics")})`],
+                   ["not_found", `Not found (${count("not_found")})`], ["error", `Errors (${count("error")})`]];
+  $("#ly-filters").innerHTML = filters.map(([k, lbl]) => `<button class="chip ${l.filter === k ? "active" : ""}" data-f="${k}">${lbl}</button>`).join("");
+
+  const rows = items.filter((i) => l.filter === "all" || i.status === l.filter);
+  const list = $("#ly-list");
+  if (!rows.length) { list.innerHTML = emptyState("music-notes-bold", items.length ? "Nothing in this filter" : "No scan yet", items.length ? "Try another filter." : "Pick a folder and press Scan."); return; }
+  list.innerHTML = rows.slice(0, 400).map((r) => {
+    const [circ, tag, icn, label] = LY_STATUS[r.status] || LY_STATUS.error;
+    const selectable = r.status === "found";
+    const on = l.ticked.has(r.id);
+    const meta = [r.artist, r.album].filter(Boolean).join(" — ") || r.name;
+    const notes = [r.synced ? "synced" : "", r.replaces ? "replaces existing" : ""].filter(Boolean).join(" · ");
+    return `<button class="list-row" ${selectable ? `data-tick="${esc(r.id)}"` : ""}>
+      <div class="circle ${circ}">${ic(selectable && on ? "check-square-bold" : icn)}</div>
+      <div class="row-text"><div class="primary-line">${esc(r.title || r.name)}</div>
+        <div class="secondary-line">${esc(meta)}${notes ? ` · ${esc(notes)}` : ""}</div>
+        ${r.message && !selectable ? `<div class="secondary-line warning-text" style="margin-top:4px">${esc(r.message)}</div>` : ""}</div>
+      <div class="row-end"><span class="tag ${tag}">${label}</span></div>
+    </button>`;
+  }).join("") + (rows.length > 400 ? `<div class="caption">Showing 400 of ${rows.length}.</div>` : "");
+}
+
 // ================================================================== REVIEW
 function mountReview() {
   $("#view-review").innerHTML = `
@@ -950,6 +1057,7 @@ function mountMore() {
     </button>`;
   $("#view-more").innerHTML = `<div class="list">
     ${item("health", "tag-bold", "c-primary", "Tag health", "Missing tags, gaps and cover art per album")}
+    ${item("lyrics", "music-notes-bold", "c-primary", "Lyrics", "Fetch lyrics for tracks that have none")}
     ${item("plex", "tv-bold", "c-violet", "Plex", "Duplicate movies and TV episodes")}
     ${item("settings", "settings-bold", "c-muted", "Settings", "Output folders, Recycle Bin, history log")}
     ${item("history", "history-bold", "c-muted", "History", "Everything moved or deleted today")}
@@ -1059,6 +1167,8 @@ function connectEvents() {
       case "dupes_done": S.dupes.running = false; if (data[0]) toast(`Scan failed: ${data[0]}`, "error"); loadDupes(true); break;
       case "health_progress": S.health.progress = { n: data[0], t: data[1], label: data[2] }; S.health.running = true; renderHealth(); break;
       case "health_done": S.health.running = false; loadHealth(); break;
+      case "lyrics_progress": S.lyrics.progress = { n: data[0], t: data[1], label: data[2] }; S.lyrics.running = true; renderLyrics(); break;
+      case "lyrics_done": S.lyrics.running = false; S.lyrics.progress = null; if (data[0]) toast(`Lyrics job failed: ${data[0]}`, "error"); loadLyrics(); break;
       case "review_progress": S.review.progress = { n: data[0], t: data[1], label: data[2] }; S.review.running = true; renderReview(); break;
       case "review_done": S.review.running = false; if (data[0]) toast(`Review job failed: ${data[0]}`, "error"); loadReview(); break;
       case "plex_progress": S.plex.progress = { n: data[0], t: data[1], label: data[2] }; S.plex.running = true; renderPlex(); break;

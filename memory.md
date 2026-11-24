@@ -52,7 +52,7 @@ Current theme: "Midnight Categorical Dashboard" (dark, adopted 2026-11-02, repla
 
 ## Testing
 - `pytest.ini`: `testpaths = tests`. `tests/conftest.py` stubs `musicbrainzngs`, `tqdm`, `mutagen` if missing.
-- Run: `python -m pytest -q` → **69 passed** (2026-11-20, after the token, Waitress and job-lock changes). `pyflakes` clean; `node --check web/app.js` clean.
+- Run: `python -m pytest -q` → **87 passed** (2026-11-24, after the Lyrics tool) (2026-11-20, after the token, Waitress and job-lock changes). `pyflakes` clean; `node --check web/app.js` clean.
 - Tests cover the access-token check, the token redirect and in-process job locking (added 2026-11-20). Cross-process lock contention is not tested.
 - Test files: `test_music_pipeline.py`, `test_toolkit_core.py`, `test_toolkit_web.py`.
 - Optional deps in dev: `requirements-dev.txt` (core + pytest + flask).
@@ -130,3 +130,13 @@ This file documents the changes made in this session, appended to memory.md.
 
 ## Test count
 Started at 37; ended at 50 passing. py_compile clean on all four Python files throughout.
+
+## Lyrics tool (added 2026-11-24)
+- Core (`toolkit_core.py`, UI-free): `lrclib_lookup` (LRCLIB `/api/get`, then `/api/search` with a 3 s duration check; stdlib `urllib`, no new dependency), `pick_lyrics_text`, `read_existing_lyrics`, `write_lyrics` (ID3 `USLT` for MP3, `\xa9lyr` for M4A, `LYRICS` Vorbis comment for FLAC/Ogg/Opus; synced LRC text goes in the same tag, like beets), `lyrics_scan`, `lyrics_apply`.
+- Network failures raise `LyricsNetworkError` and are recorded per file as errors, never as "no lyrics".
+- Existing lyrics are kept unless "Replace existing lyrics" is on. Dry run is the default and is never persisted.
+- Writes log through `History.write("lyrics", "write", path)`. The Recycle Bin is not involved because nothing is deleted.
+- Web: `/api/lyrics` (GET), `/api/lyrics/scan`, `/api/lyrics/apply`, `/api/lyrics/stop`; the `lyrics` job holds the shared `PipelineLock`. Settings: `lyrics_folder`, `lyrics_prefer_synced`, `lyrics_overwrite`.
+- Desktop: `LyricsTab` in `music_toolkit.py`, between Tag health and Review.
+- Verified: unit tests with ffmpeg-generated MP3/FLAC/M4A/Opus, web endpoints, the desktop tab under Xvfb (`python3.12` with Tk). Field names come from beets' LRCLIB client.
+- Not verified: a live LRCLIB request. The build sandbox's proxy blocks lrclib.net. Also untested: Windows, and real libraries with existing lyrics from beets' `lyrics` plugin (PR #3).
